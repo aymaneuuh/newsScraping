@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env.*
+.airflow/
+logs/
+.docker/
+*.log
+.DS_Store
+Thumbs.db

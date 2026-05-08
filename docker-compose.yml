@@ -1,0 +1,174 @@
+version: '3.7'
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - 2181:2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.1
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - 9092:9092
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data
+    ports:
+      - 9000:9000
+    volumes:
+      - minio-data:/data
+
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=pguser
+      - POSTGRES_PASSWORD=pgpassword
+      - POSTGRES_DB=football_dw
+    ports:
+      - 5432:5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  airflow-init:
+    image: apache/airflow:2.6.3
+    restart: "no"
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__CORE__FERNET_KEY=z0OIz4bs7t6nBmAQJrwDA_-ztY84i3jG_H2V-2HI5Zw=
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+      - AIRFLOW__WEBSERVER__RBAC=True
+    volumes:
+      - airflow-data:/opt/airflow
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./sql:/opt/airflow/sql
+      - ./airflow-requirements.txt:/opt/airflow/airflow-requirements.txt
+    entrypoint: ["/bin/bash","-c","airflow db init && airflow users create -u admin -p admin -f Admin -l User -r Admin -e admin@example.com"]
+
+  airflow-webserver:
+    image: apache/airflow:2.6.3
+    restart: unless-stopped
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__CORE__FERNET_KEY=z0OIz4bs7t6nBmAQJrwDA_-ztY84i3jG_H2V-2HI5Zw=
+    depends_on:
+      - airflow-init
+    command: webserver
+    ports:
+      - 8081:8080
+    volumes:
+      - airflow-data:/opt/airflow
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./sql:/opt/airflow/sql
+      - ./airflow-requirements.txt:/opt/airflow/airflow-requirements.txt
+
+  airflow-scheduler:
+    image: apache/airflow:2.6.3
+    restart: unless-stopped
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - AIRFLOW__CORE__FERNET_KEY=z0OIz4bs7t6nBmAQJrwDA_-ztY84i3jG_H2V-2HI5Zw=
+    depends_on:
+      - airflow-init
+    command: scheduler
+    volumes:
+      - airflow-data:/opt/airflow
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./sql:/opt/airflow/sql
+      - ./airflow-requirements.txt:/opt/airflow/airflow-requirements.txt
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=football_dw
+      - POSTGRES_USER=pguser
+      - POSTGRES_PASSWORD=pgpassword
+    command: streamlit run streamlit_app/app.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - 8501:8501
+    depends_on:
+      - postgres
+      - minio
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=football_dw
+      - POSTGRES_USER=pguser
+      - POSTGRES_PASSWORD=pgpassword
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - BRONZE_BUCKET=bronze-articles
+      - BRONZE_PREFIX=bronze/news
+    depends_on:
+      - postgres
+      - minio
+    command: bash -c "sleep 5 && python src/batch/ingest_batch.py && python src/transform/transform.py && python src/validation/validate.py"
+
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=news_articles
+      - NEWS_SOURCES=bbc,hespress,france24
+      - SCRAPER_MAX_ARTICLES_PER_SOURCE=6
+    depends_on:
+      - kafka
+    command: /bin/sh -c "while true; do python /app/src/collector/producer.py || true; sleep ${SCRAPE_INTERVAL_SECONDS:-300}; done"
+
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=news_articles
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - BRONZE_BUCKET=bronze-articles
+      - BRONZE_PREFIX=bronze/news
+      - BRONZE_FLUSH_SIZE=20
+      - BRONZE_FLUSH_SECONDS=15
+    depends_on:
+      - kafka
+      - minio
+    command: python /app/src/consumer/stream_processor.py
+
+volumes:
+  airflow-data:
+  minio-data:
+  pgdata:
